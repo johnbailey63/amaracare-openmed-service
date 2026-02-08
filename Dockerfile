@@ -28,5 +28,5 @@ ENV PYTHONUNBUFFERED=1
 # Expose port
 EXPOSE ${PORT}
 
-# Run with uvicorn
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT}
+# Run with uvicorn — use sh -c for proper $PORT expansion on Railway
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
