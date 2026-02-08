@@ -3,6 +3,10 @@ Pre-download OpenMed models during Docker build.
 
 This ensures models are cached in the image so the service starts instantly
 without downloading models on first request.
+
+For gated models (gene_detection_genecorpus, pii_detection_superclinical),
+set the HF_TOKEN environment variable with a HuggingFace token that has
+access to the gated repositories.
 """
 
 import os
@@ -15,6 +19,14 @@ logger = logging.getLogger(__name__)
 cache_dir = os.environ.get("OPENMED_CACHE_DIR", "/app/.cache")
 os.environ["HF_HOME"] = cache_dir
 os.environ["TRANSFORMERS_CACHE"] = cache_dir
+
+# HuggingFace auth for gated models
+hf_token = os.environ.get("HF_TOKEN", "")
+if hf_token:
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+    logger.info("HF_TOKEN set — gated model downloads enabled")
+else:
+    logger.warning("HF_TOKEN not set — gated models will be skipped during download")
 
 MODELS_TO_DOWNLOAD = [
     "disease_detection_superclinical",

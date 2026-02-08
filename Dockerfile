@@ -13,6 +13,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download models at build time so cold starts don't download them
+# HF_TOKEN is needed for gated models (gene, PII). Set as build arg in Railway.
+ARG HF_TOKEN=""
+ENV HF_TOKEN=${HF_TOKEN}
 COPY download_models.py .
 RUN python download_models.py
 

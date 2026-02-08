@@ -68,6 +68,12 @@ class ModelManager:
             os.environ["HF_HOME"] = cache_dir
             os.environ["TRANSFORMERS_CACHE"] = cache_dir
 
+        # Configure HuggingFace auth for gated models
+        hf_token = os.environ.get("HF_TOKEN", "")
+        if hf_token:
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+            logger.info("HF_TOKEN configured — gated model access enabled")
+
     def preload_models(self):
         """Load all default models into memory. Called on app startup."""
         models_env = os.environ.get("OPENMED_MODELS", "")
