@@ -40,7 +40,7 @@ async def deidentify_text(request: DeidentifyRequest) -> DeidentifyResponse:
                 text=e["text"],
                 label=e["label"],
                 confidence=e["confidence"],
-                model="pii_detection_superclinical",
+                model="pii_bioclinical",
                 start=e.get("start"),
                 end=e.get("end"),
             )

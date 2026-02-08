@@ -4,9 +4,12 @@ Pre-download OpenMed models during Docker build.
 This ensures models are cached in the image so the service starts instantly
 without downloading models on first request.
 
-For gated models (gene_detection_genecorpus, pii_detection_superclinical),
-set the HF_TOKEN environment variable with a HuggingFace token that has
-access to the gated repositories.
+NER models are downloaded via the openmed library's analyze_text() API.
+The PII model is downloaded directly from HuggingFace via transformers,
+since it's not registered as an openmed NER alias.
+
+For gated models, set the HF_TOKEN environment variable with a HuggingFace
+token that has access to the gated repositories.
 """
 
 import os
@@ -26,36 +29,64 @@ if hf_token:
     os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
     logger.info("HF_TOKEN set — gated model downloads enabled")
 else:
-    logger.warning("HF_TOKEN not set — gated models will be skipped during download")
+    logger.warning("HF_TOKEN not set — gated models may fail to download")
 
-MODELS_TO_DOWNLOAD = [
+# NER models loaded via openmed library
+NER_MODELS_TO_DOWNLOAD = [
     "disease_detection_superclinical",
     "pharma_detection_superclinical",
-    "gene_detection_genecorpus",
+    "genome_detection_bioclinical",
     "anatomy_detection_electramed",
-    "pii_detection_superclinical",
 ]
 
+# PII model loaded directly from HuggingFace (not an openmed alias)
+PII_MODEL_HF_REPO = "OpenMed/OpenMed-PII-BioClinicalModern-Base-149M-v1"
 
-def download_models():
+
+def download_ner_models():
+    """Download NER models via openmed's analyze_text API."""
     try:
         from openmed import analyze_text
 
-        # Run a dummy inference on each model to trigger download + caching
         test_text = "Patient diagnosed with cancer."
 
-        for model_name in MODELS_TO_DOWNLOAD:
-            logger.info(f"Downloading model: {model_name}")
+        for model_name in NER_MODELS_TO_DOWNLOAD:
+            logger.info(f"Downloading NER model: {model_name}")
             try:
                 analyze_text(test_text, model_name=model_name)
                 logger.info(f"  ✓ {model_name} downloaded successfully")
             except Exception as e:
                 logger.warning(f"  ✗ Failed to download {model_name}: {e}")
 
-        logger.info("Model download complete.")
+    except ImportError:
+        logger.error("openmed package not installed. Skipping NER model download.")
+
+
+def download_pii_model():
+    """Download PII model directly from HuggingFace via transformers."""
+    try:
+        from transformers import pipeline as hf_pipeline
+
+        logger.info(f"Downloading PII model: {PII_MODEL_HF_REPO}")
+        try:
+            hf_pipeline(
+                "token-classification",
+                model=PII_MODEL_HF_REPO,
+                device=-1,  # CPU
+                aggregation_strategy="simple",
+            )
+            logger.info(f"  ✓ PII model downloaded successfully")
+        except Exception as e:
+            logger.warning(f"  ✗ Failed to download PII model: {e}")
 
     except ImportError:
-        logger.error("openmed package not installed. Skipping model download.")
+        logger.error("transformers package not installed. Skipping PII model download.")
+
+
+def download_models():
+    download_ner_models()
+    download_pii_model()
+    logger.info("Model download complete.")
 
 
 if __name__ == "__main__":

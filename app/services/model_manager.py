@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import time
 import threading
 import psutil
@@ -14,24 +15,37 @@ logger = logging.getLogger(__name__)
 # Default Models to Preload
 # ===========================================
 
+# Model names are OpenMed library aliases that resolve to HuggingFace repos:
+#   disease_detection_superclinical -> OpenMed/OpenMed-NER-DiseaseDetect-SuperClinical-434M
+#   pharma_detection_superclinical  -> OpenMed/OpenMed-NER-PharmaDetect-SuperClinical-434M
+#   genome_detection_bioclinical    -> OpenMed/OpenMed-NER-GenomeDetect-BioClinical-108M
+#   anatomy_detection_electramed    -> OpenMed/OpenMed-NER-AnatomyDetect-ElectraMed-109M
+#
+# PII model uses a direct HuggingFace repo (not an OpenMed alias) since the
+# openmed library doesn't have a PII alias in its registry.
+
 DEFAULT_MODELS = {
     # NER models for clinical entity extraction
     "disease_detection_superclinical": "Disease entities (434M)",
     "pharma_detection_superclinical": "Drug/medication entities (434M)",
-    "gene_detection_genecorpus": "Gene/protein entities (109M)",
+    "genome_detection_bioclinical": "Gene/protein entities (108M)",
     "anatomy_detection_electramed": "Anatomy/body part entities (109M)",
-    # PHI de-identification
-    "pii_detection_superclinical": "PHI/PII detection (434M)",
+    # PHI de-identification — loaded directly from HuggingFace
+    "pii_bioclinical": "PHI/PII detection (149M)",
 }
 
+# The HuggingFace repo for the PII model (loaded directly, not via openmed alias)
+PII_MODEL_HF_REPO = "OpenMed/OpenMed-PII-BioClinicalModern-Base-149M-v1"
+PII_MODEL_NAME = "pii_bioclinical"
+
 # NER-only models (exclude PII from default NER runs)
-NER_MODELS = {k: v for k, v in DEFAULT_MODELS.items() if k != "pii_detection_superclinical"}
+NER_MODELS = {k: v for k, v in DEFAULT_MODELS.items() if k != PII_MODEL_NAME}
 
 # Mapping from entity category to model name (for validation endpoint)
 CATEGORY_TO_MODEL = {
     "drugs": "pharma_detection_superclinical",
     "diseases": "disease_detection_superclinical",
-    "genes": "gene_detection_genecorpus",
+    "genes": "genome_detection_bioclinical",
     "anatomy": "anatomy_detection_electramed",
 }
 
@@ -61,6 +75,7 @@ class ModelManager:
         self._model_load_times: dict[str, float] = {}
         self._start_time = time.time()
         self._inference_lock = threading.Lock()
+        self._pii_pipeline = None  # Separate pipeline for PII model
 
         # Configure OpenMed cache directory
         cache_dir = os.environ.get("OPENMED_CACHE_DIR", None)
@@ -100,7 +115,23 @@ class ModelManager:
         start = time.time()
 
         try:
-            # Import openmed here to avoid import errors if not installed
+            if model_name == PII_MODEL_NAME:
+                # PII model loaded directly from HuggingFace via transformers
+                self._load_pii_model(model_name)
+            else:
+                # NER models loaded via openmed library
+                self._load_ner_model(model_name)
+
+        except Exception as e:
+            self._model_status[model_name] = "failed"
+            self._model_load_times[model_name] = (time.time() - start) * 1000
+            logger.error(f"Failed to load model '{model_name}': {e}")
+
+    def _load_ner_model(self, model_name: str):
+        """Load an NER model via the openmed library."""
+        start = time.time()
+
+        try:
             from openmed import ModelLoader
 
             loader = ModelLoader()
@@ -110,20 +141,39 @@ class ModelManager:
             self._model_status[model_name] = "loaded"
             elapsed = (time.time() - start) * 1000
             self._model_load_times[model_name] = elapsed
-            logger.info(f"Loaded model '{model_name}' in {elapsed:.0f}ms")
+            logger.info(f"Loaded NER model '{model_name}' in {elapsed:.0f}ms")
 
         except ImportError:
-            # OpenMed not installed — use analyze_text API instead
+            # ModelLoader not available — use analyze_text API instead
             logger.warning(f"ModelLoader not available, will use analyze_text() for '{model_name}'")
             self._models[model_name] = "api_mode"
             self._model_status[model_name] = "loaded"
             elapsed = (time.time() - start) * 1000
             self._model_load_times[model_name] = elapsed
 
-        except Exception as e:
-            self._model_status[model_name] = "failed"
-            self._model_load_times[model_name] = (time.time() - start) * 1000
-            logger.error(f"Failed to load model '{model_name}': {e}")
+    def _load_pii_model(self, model_name: str):
+        """Load the PII model directly from HuggingFace transformers."""
+        start = time.time()
+
+        try:
+            from transformers import pipeline as hf_pipeline
+
+            device = 0 if os.environ.get("OPENMED_DEVICE", "cpu") == "cuda" else -1
+            pii_pipe = hf_pipeline(
+                "token-classification",
+                model=PII_MODEL_HF_REPO,
+                device=device,
+                aggregation_strategy="simple",
+            )
+            self._pii_pipeline = pii_pipe
+            self._models[model_name] = pii_pipe
+            self._model_status[model_name] = "loaded"
+            elapsed = (time.time() - start) * 1000
+            self._model_load_times[model_name] = elapsed
+            logger.info(f"Loaded PII model '{PII_MODEL_HF_REPO}' in {elapsed:.0f}ms")
+
+        except ImportError:
+            raise RuntimeError("transformers package required for PII model. Install with: pip install transformers")
 
     def analyze(self, text: str, model_name: str, confidence_threshold: float = 0.5) -> list[dict]:
         """
@@ -165,50 +215,79 @@ class ModelManager:
 
     def deidentify(self, text: str, method: str = "mask", confidence_threshold: float = 0.3) -> dict:
         """
-        De-identify PHI in text.
+        De-identify PHI in text using the PII NER model.
+
+        Approach: Run the PII token-classification model to detect PHI entities,
+        then mask/remove/replace them in the original text.
+
         Returns: { deidentified_text, entities, mapping }
         """
+        # Ensure PII model is loaded
+        if PII_MODEL_NAME not in self._models:
+            self._load_model(PII_MODEL_NAME)
+
+        if self._model_status.get(PII_MODEL_NAME) != "loaded":
+            raise RuntimeError(f"PII model not available (status: {self._model_status.get(PII_MODEL_NAME)})")
+
+        if self._pii_pipeline is None:
+            raise RuntimeError("PII pipeline not initialized")
+
         try:
-            from openmed import extract_pii, deidentify
-
             with self._inference_lock:
-                # First extract PII entities
-                pii_result = extract_pii(
-                    text,
-                    model_name="pii_detection_superclinical",
-                    confidence_threshold=confidence_threshold,
-                )
+                raw_entities = self._pii_pipeline(text)
 
-                # Then de-identify
-                deid_result = deidentify(
-                    text,
-                    method=method,
-                    model_name="pii_detection_superclinical",
-                    confidence_threshold=confidence_threshold,
-                )
-
-            # Build a mapping from placeholder to original for re-hydration
-            mapping = {}
+            # Filter by confidence and build entity list
             entities = []
-            placeholder_counts: dict[str, int] = {}
-
-            for entity in pii_result.entities:
-                label = entity.label
-                count = placeholder_counts.get(label, 0)
-                placeholder_key = f"[{label}]_{count}"
-                placeholder_counts[label] = count + 1
-                mapping[placeholder_key] = entity.text
+            for ent in raw_entities:
+                score = ent.get("score", 0)
+                if score < confidence_threshold:
+                    continue
 
                 entities.append({
-                    "text": entity.text,
-                    "label": entity.label,
-                    "confidence": entity.confidence,
-                    "start": getattr(entity, "start", None),
-                    "end": getattr(entity, "end", None),
+                    "text": ent.get("word", ""),
+                    "label": ent.get("entity_group", ent.get("entity", "PHI")),
+                    "confidence": score,
+                    "start": ent.get("start"),
+                    "end": ent.get("end"),
                 })
 
+            # Sort entities by position (end to start) for safe replacement
+            sorted_entities = sorted(entities, key=lambda e: e.get("start", 0), reverse=True)
+
+            # Build mapping and de-identified text
+            mapping = {}
+            placeholder_counts: dict[str, int] = {}
+            deidentified = text
+
+            for ent in sorted_entities:
+                label = ent["label"]
+                start = ent.get("start")
+                end = ent.get("end")
+                original = ent["text"]
+
+                if start is None or end is None:
+                    continue
+
+                # Generate placeholder key
+                count = placeholder_counts.get(label, 0)
+                placeholder_key = f"[{label}_{count}]"
+                placeholder_counts[label] = count + 1
+                mapping[placeholder_key] = original
+
+                # Apply de-identification method
+                if method == "mask":
+                    replacement = placeholder_key
+                elif method == "remove":
+                    replacement = ""
+                elif method == "replace":
+                    replacement = self._generate_synthetic(label)
+                else:
+                    replacement = placeholder_key
+
+                deidentified = deidentified[:start] + replacement + deidentified[end:]
+
             return {
-                "deidentified_text": deid_result.deidentified_text,
+                "deidentified_text": deidentified,
                 "entities": entities,
                 "mapping": mapping,
             }
@@ -216,6 +295,26 @@ class ModelManager:
         except Exception as e:
             logger.error(f"De-identification failed: {e}")
             raise
+
+    @staticmethod
+    def _generate_synthetic(label: str) -> str:
+        """Generate a synthetic replacement value for a PHI label."""
+        synthetics = {
+            "FIRST_NAME": "Jane",
+            "LAST_NAME": "Doe",
+            "NAME": "Jane Doe",
+            "DATE": "2000-01-01",
+            "DATE_OF_BIRTH": "1960-01-01",
+            "AGE": "60",
+            "LOCATION": "Springfield",
+            "HOSPITAL": "General Hospital",
+            "PHONE": "555-0100",
+            "EMAIL": "patient@example.com",
+            "ID": "000-00-0000",
+            "SSN": "000-00-0000",
+            "MRN": "MRN-000000",
+        }
+        return synthetics.get(label.upper(), f"[{label}]")
 
     def get_loaded_models(self) -> list[dict]:
         """Return info about all models and their status."""
@@ -233,7 +332,7 @@ class ModelManager:
         return [
             name for name in self._models
             if self._model_status.get(name) == "loaded"
-            and name != "pii_detection_superclinical"
+            and name != PII_MODEL_NAME
         ]
 
     @property
