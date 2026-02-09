@@ -239,7 +239,13 @@ class ModelManager:
                         "end": end,
                     })
 
-            return entities
+            # Merge adjacent entities with the same label.
+            # Some models (especially genome_detection) produce per-character
+            # predictions for gene names (E, G, F, R instead of EGFR).
+            # We merge entities that are adjacent or overlapping with the same label.
+            merged = self._merge_adjacent_entities(entities, text)
+
+            return merged
 
         except Exception as e:
             logger.error(f"Inference failed for model '{model_name}': {e}")
@@ -272,6 +278,52 @@ class ModelManager:
         except Exception as e:
             logger.error(f"Fallback inference via analyze_text() failed for model '{model_name}': {e}")
             raise
+
+    @staticmethod
+    def _merge_adjacent_entities(entities: list[dict], original_text: str) -> list[dict]:
+        """
+        Merge adjacent entities with the same label into single entities.
+
+        Some NER models (especially genome_detection_bioclinical) tokenize gene
+        names at the character level, producing E, G, F, R instead of EGFR.
+        This merges adjacent same-label entities by checking if they touch or
+        are separated by at most 1 character in the original text.
+        """
+        if not entities:
+            return entities
+
+        # Sort by start position
+        sorted_ents = sorted(
+            [e for e in entities if isinstance(e.get("start"), int)],
+            key=lambda e: e["start"],
+        )
+        # Keep entities without position info as-is
+        no_position = [e for e in entities if not isinstance(e.get("start"), int)]
+
+        if not sorted_ents:
+            return no_position
+
+        merged = [sorted_ents[0].copy()]
+
+        for ent in sorted_ents[1:]:
+            prev = merged[-1]
+
+            # Merge if same label and adjacent (gap ≤ 1 character)
+            if (
+                ent["label"] == prev["label"]
+                and isinstance(prev.get("end"), int)
+                and isinstance(ent.get("start"), int)
+                and ent["start"] <= prev["end"] + 1
+            ):
+                # Extend the previous entity
+                prev["end"] = max(prev["end"], ent["end"])
+                prev["text"] = original_text[prev["start"]:prev["end"]].strip()
+                # Average the confidence scores
+                prev["confidence"] = (prev["confidence"] + ent["confidence"]) / 2
+            else:
+                merged.append(ent.copy())
+
+        return merged + no_position
 
     def deidentify(self, text: str, method: str = "mask", confidence_threshold: float = 0.3) -> dict:
         """
