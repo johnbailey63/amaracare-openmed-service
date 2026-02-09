@@ -135,8 +135,11 @@ class ModelManager:
             from openmed import ModelLoader
 
             loader = ModelLoader()
-            device = os.environ.get("OPENMED_DEVICE", "cpu")
-            pipeline = loader.create_pipeline(model_name=model_name, task="ner", device=device)
+            pipeline = loader.create_pipeline(
+                model_name=model_name,
+                task="token-classification",
+                aggregation_strategy="simple",
+            )
             self._models[model_name] = pipeline
             self._model_status[model_name] = "loaded"
             elapsed = (time.time() - start) * 1000
@@ -177,8 +180,12 @@ class ModelManager:
 
     def analyze(self, text: str, model_name: str, confidence_threshold: float = 0.5) -> list[dict]:
         """
-        Run NER analysis on text using a specific model.
+        Run NER analysis on text using the preloaded pipeline.
         Returns list of entity dicts: { text, label, confidence, start, end }
+
+        Uses the cached HuggingFace pipeline directly (loaded at startup)
+        instead of calling openmed.analyze_text() which would re-download
+        models from HuggingFace on every request.
         """
         # Lazy-load if not preloaded
         if model_name not in self._models:
@@ -187,6 +194,59 @@ class ModelManager:
         if self._model_status.get(model_name) != "loaded":
             raise RuntimeError(f"Model '{model_name}' is not available (status: {self._model_status.get(model_name)})")
 
+        pipeline = self._models[model_name]
+
+        # Fallback: if pipeline was stored as "api_mode" (ModelLoader unavailable),
+        # use the openmed analyze_text API as a last resort
+        if pipeline == "api_mode":
+            return self._analyze_via_api(text, model_name, confidence_threshold)
+
+        try:
+            with self._inference_lock:
+                raw_predictions = pipeline(text)
+
+            # Post-process raw HuggingFace predictions into clean entity dicts.
+            # The pipeline uses aggregation_strategy="simple" so predictions have
+            # entity_group, score, word, start, end keys.
+            entities = []
+            for pred in raw_predictions:
+                score = pred.get("score", 0.0)
+                if score < confidence_threshold:
+                    continue
+
+                # Extract entity text: prefer span from original text, fall back to token word
+                start = pred.get("start")
+                end = pred.get("end")
+                if isinstance(start, int) and isinstance(end, int):
+                    entity_text = text[start:end].strip()
+                else:
+                    entity_text = pred.get("word", "")
+
+                # Clean up tokenizer artifacts (subword markers)
+                if not entity_text:
+                    entity_text = pred.get("word", "").replace("##", "").replace("▁", " ").strip()
+
+                # Clean label: remove B-/I- prefix if present
+                raw_label = pred.get("entity_group") or pred.get("entity") or "UNKNOWN"
+                label = raw_label.replace("B-", "").replace("I-", "")
+
+                if entity_text:
+                    entities.append({
+                        "text": entity_text,
+                        "label": label,
+                        "confidence": score,
+                        "start": start,
+                        "end": end,
+                    })
+
+            return entities
+
+        except Exception as e:
+            logger.error(f"Inference failed for model '{model_name}': {e}")
+            raise
+
+    def _analyze_via_api(self, text: str, model_name: str, confidence_threshold: float) -> list[dict]:
+        """Fallback: use openmed.analyze_text() when ModelLoader was unavailable at startup."""
         try:
             from openmed import analyze_text
 
@@ -210,7 +270,7 @@ class ModelManager:
             return entities
 
         except Exception as e:
-            logger.error(f"Inference failed for model '{model_name}': {e}")
+            logger.error(f"Fallback inference via analyze_text() failed for model '{model_name}': {e}")
             raise
 
     def deidentify(self, text: str, method: str = "mask", confidence_threshold: float = 0.3) -> dict:
