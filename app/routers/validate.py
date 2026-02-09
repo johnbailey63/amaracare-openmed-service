@@ -17,7 +17,7 @@ router = APIRouter()
 
 
 @router.post("/validate", response_model=ValidateResponse)
-async def validate_extraction(request: ValidateRequest) -> ValidateResponse:
+def validate_extraction(request: ValidateRequest) -> ValidateResponse:
     """
     Cross-validate entities extracted by an LLM against biomedical NER models.
 

@@ -13,7 +13,7 @@ router = APIRouter()
 
 
 @router.post("/deidentify", response_model=DeidentifyResponse)
-async def deidentify_text(request: DeidentifyRequest) -> DeidentifyResponse:
+def deidentify_text(request: DeidentifyRequest) -> DeidentifyResponse:
     """
     De-identify protected health information (PHI) from clinical text.
 

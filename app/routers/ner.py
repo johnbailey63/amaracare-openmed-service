@@ -13,7 +13,7 @@ router = APIRouter()
 
 
 @router.post("/ner", response_model=NERResponse)
-async def extract_entities(request: NERRequest) -> NERResponse:
+def extract_entities(request: NERRequest) -> NERResponse:
     """
     Run biomedical NER models on clinical text.
 
