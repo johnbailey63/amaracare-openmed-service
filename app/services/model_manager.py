@@ -74,7 +74,6 @@ class ModelManager:
         self._model_status: dict[str, str] = {}  # "loaded" | "loading" | "failed"
         self._model_load_times: dict[str, float] = {}
         self._start_time = time.time()
-        self._inference_lock = threading.Lock()
         self._pii_pipeline = None  # Separate pipeline for PII model
 
         # Configure OpenMed cache directory
@@ -202,8 +201,7 @@ class ModelManager:
             return self._analyze_via_api(text, model_name, confidence_threshold)
 
         try:
-            with self._inference_lock:
-                raw_predictions = pipeline(text)
+            raw_predictions = pipeline(text)
 
             # Post-process raw HuggingFace predictions into clean entity dicts.
             # The pipeline uses aggregation_strategy="simple" so predictions have
@@ -256,12 +254,11 @@ class ModelManager:
         try:
             from openmed import analyze_text
 
-            with self._inference_lock:
-                result = analyze_text(
-                    text,
-                    model_name=model_name,
-                    confidence_threshold=confidence_threshold,
-                )
+            result = analyze_text(
+                text,
+                model_name=model_name,
+                confidence_threshold=confidence_threshold,
+            )
 
             entities = []
             for entity in result.entities:
@@ -345,8 +342,7 @@ class ModelManager:
             raise RuntimeError("PII pipeline not initialized")
 
         try:
-            with self._inference_lock:
-                raw_entities = self._pii_pipeline(text)
+            raw_entities = self._pii_pipeline(text)
 
             # Filter by confidence and build entity list
             entities = []
