@@ -38,6 +38,15 @@ DEFAULT_MODELS = {
 PII_MODEL_HF_REPO = "OpenMed/OpenMed-PII-BioClinicalModern-Base-149M-v1"
 PII_MODEL_NAME = "pii_bioclinical"
 
+# OncologyDetect models — cancer-specific NER trained on BioNLP 2013 Cancer Genetics corpus.
+# Loaded directly from HuggingFace (not openmed aliases). NOT in DEFAULT_MODELS — only
+# loaded on-demand when explicitly requested via the `models` parameter on /ner.
+ONCOLOGY_MODELS = {
+    "oncology_superclinical": "OpenMed/OpenMed-NER-OncologyDetect-SuperClinical-434M",
+    "oncology_multimed": "OpenMed/OpenMed-NER-OncologyDetect-MultiMed-568M",
+    "oncology_pubmed": "OpenMed/OpenMed-NER-OncologyDetect-PubMed-335M",
+}
+
 # NER-only models (exclude PII from default NER runs)
 NER_MODELS = {k: v for k, v in DEFAULT_MODELS.items() if k != PII_MODEL_NAME}
 
@@ -117,6 +126,9 @@ class ModelManager:
             if model_name == PII_MODEL_NAME:
                 # PII model loaded directly from HuggingFace via transformers
                 self._load_pii_model(model_name)
+            elif model_name in ONCOLOGY_MODELS:
+                # OncologyDetect models loaded directly from HuggingFace
+                self._load_oncology_model(model_name)
             else:
                 # NER models loaded via openmed library
                 self._load_ner_model(model_name)
@@ -176,6 +188,30 @@ class ModelManager:
 
         except ImportError:
             raise RuntimeError("transformers package required for PII model. Install with: pip install transformers")
+
+    def _load_oncology_model(self, model_name: str):
+        """Load an OncologyDetect model directly from HuggingFace transformers."""
+        start = time.time()
+
+        try:
+            from transformers import pipeline as hf_pipeline
+
+            hf_repo = ONCOLOGY_MODELS[model_name]
+            device = 0 if os.environ.get("OPENMED_DEVICE", "cpu") == "cuda" else -1
+            pipe = hf_pipeline(
+                "token-classification",
+                model=hf_repo,
+                device=device,
+                aggregation_strategy="simple",
+            )
+            self._models[model_name] = pipe
+            self._model_status[model_name] = "loaded"
+            elapsed = (time.time() - start) * 1000
+            self._model_load_times[model_name] = elapsed
+            logger.info(f"Loaded OncologyDetect model '{hf_repo}' in {elapsed:.0f}ms")
+
+        except ImportError:
+            raise RuntimeError("transformers package required for OncologyDetect models. Install with: pip install transformers")
 
     def analyze(self, text: str, model_name: str, confidence_threshold: float = 0.5) -> list[dict]:
         """
@@ -436,11 +472,14 @@ class ModelManager:
         ]
 
     def get_available_ner_models(self) -> list[str]:
-        """Return names of loaded NER models (excluding PII)."""
+        """Return names of loaded NER models (excluding PII and OncologyDetect).
+        OncologyDetect models are experimental and only run when explicitly
+        requested via the `models` parameter on /ner."""
         return [
             name for name in self._models
             if self._model_status.get(name) == "loaded"
             and name != PII_MODEL_NAME
+            and name not in ONCOLOGY_MODELS
         ]
 
     @property

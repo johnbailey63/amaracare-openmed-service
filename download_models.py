@@ -42,6 +42,13 @@ NER_MODELS_TO_DOWNLOAD = [
 # PII model loaded directly from HuggingFace (not an openmed alias)
 PII_MODEL_HF_REPO = "OpenMed/OpenMed-PII-BioClinicalModern-Base-149M-v1"
 
+# OncologyDetect models — cancer-specific NER (loaded directly from HuggingFace)
+ONCOLOGY_MODELS_TO_DOWNLOAD = {
+    "oncology_superclinical": "OpenMed/OpenMed-NER-OncologyDetect-SuperClinical-434M",
+    "oncology_multimed": "OpenMed/OpenMed-NER-OncologyDetect-MultiMed-568M",
+    "oncology_pubmed": "OpenMed/OpenMed-NER-OncologyDetect-PubMed-335M",
+}
+
 
 def download_ner_models():
     """Download NER models via openmed's analyze_text API."""
@@ -83,9 +90,32 @@ def download_pii_model():
         logger.error("transformers package not installed. Skipping PII model download.")
 
 
+def download_oncology_models():
+    """Download OncologyDetect models directly from HuggingFace via transformers."""
+    try:
+        from transformers import pipeline as hf_pipeline
+
+        for name, repo in ONCOLOGY_MODELS_TO_DOWNLOAD.items():
+            logger.info(f"Downloading OncologyDetect model: {name} ({repo})")
+            try:
+                hf_pipeline(
+                    "token-classification",
+                    model=repo,
+                    device=-1,  # CPU
+                    aggregation_strategy="simple",
+                )
+                logger.info(f"  ✓ {name} downloaded successfully")
+            except Exception as e:
+                logger.warning(f"  ✗ Failed to download {name}: {e}")
+
+    except ImportError:
+        logger.error("transformers package not installed. Skipping OncologyDetect model download.")
+
+
 def download_models():
     download_ner_models()
     download_pii_model()
+    download_oncology_models()
     logger.info("Model download complete.")
 
 
