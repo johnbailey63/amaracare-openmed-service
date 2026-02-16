@@ -30,6 +30,10 @@ DEFAULT_MODELS = {
     "pharma_detection_superclinical": "Drug/medication entities (434M)",
     "genome_detection_bioclinical": "Gene/protein entities (108M)",
     "anatomy_detection_electramed": "Anatomy/body part entities (109M)",
+    # Cancer-specific NER — trained on BioNLP 2013 Cancer Genetics corpus (27 entity types).
+    # Loaded directly from HuggingFace (not an openmed alias). Complements the general-
+    # purpose models above with higher-precision gene/cancer detection (F1=0.923, 93% prec).
+    "oncology_pubmed": "Oncology entities — cancer, genes, chemicals (335M)",
     # PHI de-identification — loaded directly from HuggingFace
     "pii_bioclinical": "PHI/PII detection (149M)",
 }
@@ -38,13 +42,17 @@ DEFAULT_MODELS = {
 PII_MODEL_HF_REPO = "OpenMed/OpenMed-PII-BioClinicalModern-Base-149M-v1"
 PII_MODEL_NAME = "pii_bioclinical"
 
-# OncologyDetect models — cancer-specific NER trained on BioNLP 2013 Cancer Genetics corpus.
-# Loaded directly from HuggingFace (not openmed aliases). NOT in DEFAULT_MODELS — only
-# loaded on-demand when explicitly requested via the `models` parameter on /ner.
+# OncologyDetect HuggingFace repo for the production model (oncology_pubmed).
+# Loaded directly from HuggingFace via transformers, not via openmed alias.
+ONCOLOGY_PUBMED_HF_REPO = "OpenMed/OpenMed-NER-OncologyDetect-PubMed-335M"
+ONCOLOGY_PUBMED_MODEL_NAME = "oncology_pubmed"
+
+# Other OncologyDetect variants — kept for on-demand comparison testing only.
+# NOT in DEFAULT_MODELS. Loaded on-demand via `models` parameter on /ner.
 ONCOLOGY_MODELS = {
     "oncology_superclinical": "OpenMed/OpenMed-NER-OncologyDetect-SuperClinical-434M",
     "oncology_multimed": "OpenMed/OpenMed-NER-OncologyDetect-MultiMed-568M",
-    "oncology_pubmed": "OpenMed/OpenMed-NER-OncologyDetect-PubMed-335M",
+    "oncology_pubmed": ONCOLOGY_PUBMED_HF_REPO,
 }
 
 # NER-only models (exclude PII from default NER runs)
@@ -472,14 +480,16 @@ class ModelManager:
         ]
 
     def get_available_ner_models(self) -> list[str]:
-        """Return names of loaded NER models (excluding PII and OncologyDetect).
-        OncologyDetect models are experimental and only run when explicitly
-        requested via the `models` parameter on /ner."""
+        """Return names of loaded NER models (excluding PII and experimental OncologyDetect variants).
+        oncology_pubmed IS included (production model in DEFAULT_MODELS).
+        oncology_superclinical/oncology_multimed are excluded (on-demand comparison only)."""
+        # Experimental models that should NOT run by default
+        experimental_oncology = {k for k in ONCOLOGY_MODELS if k != ONCOLOGY_PUBMED_MODEL_NAME}
         return [
             name for name in self._models
             if self._model_status.get(name) == "loaded"
             and name != PII_MODEL_NAME
-            and name not in ONCOLOGY_MODELS
+            and name not in experimental_oncology
         ]
 
     @property
