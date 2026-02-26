@@ -1,18 +1,20 @@
-"""Singleton model manager for loading and caching OpenMed models."""
+"""Singleton model manager with lazy loading and LRU eviction for OpenMed models."""
 
+import gc
 import logging
 import os
-import re
 import time
 import threading
 import psutil
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
 # ===========================================
-# Default Models to Preload
+# Default Models
 # ===========================================
 
 # Model names are OpenMed library aliases that resolve to HuggingFace repos:
@@ -67,17 +69,42 @@ CATEGORY_TO_MODEL = {
 }
 
 
+# ===========================================
+# Lazy Loading & Eviction Config
+# ===========================================
+
+# Estimated RSS memory per model in MB (for pre-eviction sizing decisions).
+# Actual RSS is used for threshold checks; these are for "will it fit?" predictions.
+MODEL_MEMORY_ESTIMATES_MB: dict[str, float] = {
+    "pii_bioclinical": 600,
+    "disease_detection_superclinical": 1700,
+    "pharma_detection_superclinical": 1700,
+    "oncology_pubmed": 1300,
+    "genome_detection_bioclinical": 400,
+    "anatomy_detection_electramed": 400,
+}
+
+# Models that must never be evicted from memory
+PINNED_MODELS: set[str] = {PII_MODEL_NAME}
+
+# Default memory ceiling in MB — configurable via OPENMED_MAX_MEMORY_MB
+DEFAULT_MAX_MEMORY_MB = 2048
+
+
 class ModelManager:
     """
-    Thread-safe singleton that loads and caches OpenMed models.
-    Models are loaded into memory on startup and reused across requests.
+    Thread-safe singleton that manages OpenMed model lifecycle.
+
+    Only critical models (PHI de-identification) are loaded at startup.
+    NER models are lazy-loaded on first request and evicted LRU-style
+    when memory pressure exceeds the configured ceiling.
     """
 
     _instance: Optional["ModelManager"] = None
-    _lock = threading.Lock()
+    _singleton_lock = threading.Lock()
 
     def __new__(cls) -> "ModelManager":
-        with cls._lock:
+        with cls._singleton_lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
                 cls._instance._initialized = False
@@ -87,11 +114,24 @@ class ModelManager:
         if self._initialized:
             return
         self._initialized = True
-        self._models: dict[str, object] = {}
-        self._model_status: dict[str, str] = {}  # "loaded" | "loading" | "failed"
+
+        # Model storage — OrderedDict for LRU tracking (most recently used at end)
+        self._models: OrderedDict[str, object] = OrderedDict()
+        self._model_status: dict[str, str] = {}  # "loaded" | "available" | "loading" | "evicted" | "failed"
         self._model_load_times: dict[str, float] = {}
+        self._model_last_used: dict[str, float] = {}
+        self._eviction_count: dict[str, int] = {}
         self._start_time = time.time()
-        self._pii_pipeline = None  # Separate pipeline for PII model
+        self._pii_pipeline = None  # Separate reference for PII model
+
+        # Thread safety — per-model locks + global lock for eviction decisions
+        self._global_lock = threading.Lock()
+        self._model_locks: dict[str, threading.Lock] = {}
+
+        # Memory configuration
+        self._max_memory_mb: float = float(
+            os.environ.get("OPENMED_MAX_MEMORY_MB", str(DEFAULT_MAX_MEMORY_MB))
+        )
 
         # Configure OpenMed cache directory
         cache_dir = os.environ.get("OPENMED_CACHE_DIR", None)
@@ -105,26 +145,207 @@ class ModelManager:
             os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
             logger.info("HF_TOKEN configured — gated model access enabled")
 
+    # ===========================================
+    # Startup
+    # ===========================================
+
+    def _parse_preload_env(self) -> list[str]:
+        """Parse which models to eagerly preload at startup."""
+        # New env var takes priority
+        env_val = os.environ.get("OPENMED_PRELOAD_MODELS", "")
+        if env_val:
+            return [m.strip() for m in env_val.split(",") if m.strip()]
+
+        # Backward compat: old OPENMED_MODELS env var
+        old_env = os.environ.get("OPENMED_MODELS", "")
+        if old_env:
+            logger.warning(
+                "OPENMED_MODELS is deprecated — use OPENMED_PRELOAD_MODELS instead. "
+                "With lazy loading, only critical models need preloading (default: pii_bioclinical)."
+            )
+            return [m.strip() for m in old_env.split(",") if m.strip()]
+
+        # Default: only PII model (critical path for every chat turn)
+        return [PII_MODEL_NAME]
+
     def preload_models(self):
-        """Load all default models into memory. Called on app startup."""
-        models_env = os.environ.get("OPENMED_MODELS", "")
-        if models_env:
-            model_names = [m.strip() for m in models_env.split(",") if m.strip()]
-        else:
-            model_names = list(DEFAULT_MODELS.keys())
+        """Load only critical models at startup. Others are lazy-loaded on demand."""
+        preload_list = self._parse_preload_env()
 
-        logger.info(f"Preloading {len(model_names)} models...")
+        # Register ALL default models as "available" (on disk, not in RAM)
+        for model_name in DEFAULT_MODELS:
+            if model_name not in self._model_status:
+                self._model_status[model_name] = "available"
 
-        for model_name in model_names:
-            self._load_model(model_name)
+        # Preload only the configured subset
+        for model_name in preload_list:
+            if model_name in DEFAULT_MODELS or model_name in ONCOLOGY_MODELS:
+                logger.info(f"Preloading critical model: {model_name}")
+                self._load_model(model_name)
+                self._touch_model(model_name)
 
         loaded = sum(1 for s in self._model_status.values() if s == "loaded")
-        failed = sum(1 for s in self._model_status.values() if s == "failed")
-        logger.info(f"Model preload complete: {loaded} loaded, {failed} failed")
+        available = sum(1 for s in self._model_status.values() if s == "available")
+        logger.info(
+            f"Model init complete: {loaded} loaded (in RAM), "
+            f"{available} available (on disk, lazy-load), "
+            f"memory: {self.memory_mb:.0f} MB / {self._max_memory_mb:.0f} MB limit"
+        )
+
+    # ===========================================
+    # LRU Tracking
+    # ===========================================
+
+    def _touch_model(self, model_name: str):
+        """Mark model as recently used (move to end of LRU OrderedDict)."""
+        self._model_last_used[model_name] = time.time()
+        if model_name in self._models:
+            self._models.move_to_end(model_name)
+
+    def _get_model_lock(self, model_name: str) -> threading.Lock:
+        """Get or create a per-model lock for thread-safe loading."""
+        with self._global_lock:
+            if model_name not in self._model_locks:
+                self._model_locks[model_name] = threading.Lock()
+            return self._model_locks[model_name]
+
+    # ===========================================
+    # Lazy Loading
+    # ===========================================
+
+    def _ensure_model_loaded(self, model_name: str):
+        """Ensure a model is in memory, lazy-loading and evicting as needed. Thread-safe."""
+        # Fast path: already loaded (no lock needed for read)
+        if model_name in self._models and self._model_status.get(model_name) == "loaded":
+            self._touch_model(model_name)
+            return
+
+        # Slow path: need to load — acquire per-model lock
+        model_lock = self._get_model_lock(model_name)
+        with model_lock:
+            # Double-check after acquiring lock (another thread may have loaded it)
+            if model_name in self._models and self._model_status.get(model_name) == "loaded":
+                self._touch_model(model_name)
+                return
+
+            # Eviction needs the global lock (modifies shared state)
+            with self._global_lock:
+                estimated_mb = MODEL_MEMORY_ESTIMATES_MB.get(model_name, 500)
+                self._evict_if_needed(estimated_mb)
+
+            # Load (outside global lock to avoid blocking other threads during IO)
+            logger.info(
+                f"Lazy-loading model '{model_name}' "
+                f"(memory: {self.memory_mb:.0f} MB / {self._max_memory_mb:.0f} MB)"
+            )
+            self._load_model(model_name)
+            self._touch_model(model_name)
+
+    def ensure_models_loaded(self, model_names: list[str]):
+        """
+        Load multiple models, parallelizing cold loads.
+
+        When /ner is called with all 5 NER models and some are evicted, loading
+        them sequentially would take 30-45s. Parallel loading reduces this to
+        ~12-15s (limited by the single largest model).
+        """
+        needs_loading = [
+            name for name in model_names
+            if name not in self._models or self._model_status.get(name) != "loaded"
+        ]
+
+        if not needs_loading:
+            # All models already loaded — just touch LRU
+            for name in model_names:
+                self._touch_model(name)
+            return
+
+        if len(needs_loading) == 1:
+            self._ensure_model_loaded(needs_loading[0])
+            return
+
+        # Pre-evict for total estimated memory needed
+        with self._global_lock:
+            total_needed = sum(
+                MODEL_MEMORY_ESTIMATES_MB.get(n, 500) for n in needs_loading
+            )
+            self._evict_if_needed(total_needed)
+
+        # Parallel load via thread pool
+        logger.info(f"Parallel-loading {len(needs_loading)} models: {needs_loading}")
+        with ThreadPoolExecutor(max_workers=min(len(needs_loading), 3)) as executor:
+            futures = {
+                executor.submit(self._ensure_model_loaded, name): name
+                for name in needs_loading
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Parallel load failed for '{name}': {e}")
+
+    # ===========================================
+    # LRU Eviction
+    # ===========================================
+
+    def _evict_if_needed(self, needed_mb: float):
+        """
+        Evict least-recently-used models until there's room for needed_mb.
+        Must be called with self._global_lock held.
+        """
+        current_mb = self.memory_mb
+
+        if current_mb + needed_mb <= self._max_memory_mb:
+            return  # Enough room
+
+        logger.info(
+            f"Memory pressure: {current_mb:.0f} MB + ~{needed_mb:.0f} MB needed "
+            f"> {self._max_memory_mb:.0f} MB limit. Starting eviction..."
+        )
+
+        # Walk LRU order (front = least recently used), skip pinned
+        eviction_candidates = [
+            name for name in self._models
+            if name not in PINNED_MODELS and self._model_status.get(name) == "loaded"
+        ]
+
+        for model_name in eviction_candidates:
+            if self.memory_mb + needed_mb <= self._max_memory_mb:
+                break
+            self._evict_model(model_name)
+
+        # Force garbage collection after evictions
+        gc.collect()
+        logger.info(f"Post-eviction memory: {self.memory_mb:.0f} MB")
+
+    def _evict_model(self, model_name: str):
+        """Remove a model from memory, freeing its RAM."""
+        if model_name in PINNED_MODELS:
+            logger.warning(f"Refusing to evict pinned model '{model_name}'")
+            return
+
+        if model_name not in self._models:
+            return
+
+        last_used = self._model_last_used.get(model_name, 0)
+        ago = time.time() - last_used if last_used else 0
+        logger.info(f"Evicting model '{model_name}' (last used {ago:.0f}s ago)")
+
+        # Delete the pipeline object
+        pipeline = self._models.pop(model_name, None)
+        del pipeline
+
+        self._model_status[model_name] = "evicted"
+        self._eviction_count[model_name] = self._eviction_count.get(model_name, 0) + 1
+
+    # ===========================================
+    # Model Loading (internal)
+    # ===========================================
 
     def _load_model(self, model_name: str):
         """Load a single model into memory."""
-        if model_name in self._models:
+        if model_name in self._models and self._model_status.get(model_name) == "loaded":
             return
 
         self._model_status[model_name] = "loading"
@@ -132,13 +353,10 @@ class ModelManager:
 
         try:
             if model_name == PII_MODEL_NAME:
-                # PII model loaded directly from HuggingFace via transformers
                 self._load_pii_model(model_name)
             elif model_name in ONCOLOGY_MODELS:
-                # OncologyDetect models loaded directly from HuggingFace
                 self._load_oncology_model(model_name)
             else:
-                # NER models loaded via openmed library
                 self._load_ner_model(model_name)
 
         except Exception as e:
@@ -221,18 +439,19 @@ class ModelManager:
         except ImportError:
             raise RuntimeError("transformers package required for OncologyDetect models. Install with: pip install transformers")
 
+    # ===========================================
+    # Inference
+    # ===========================================
+
     def analyze(self, text: str, model_name: str, confidence_threshold: float = 0.5) -> list[dict]:
         """
-        Run NER analysis on text using the preloaded pipeline.
+        Run NER analysis on text using a model pipeline.
         Returns list of entity dicts: { text, label, confidence, start, end }
 
-        Uses the cached HuggingFace pipeline directly (loaded at startup)
-        instead of calling openmed.analyze_text() which would re-download
-        models from HuggingFace on every request.
+        Lazy-loads the model if not already in memory, evicting LRU models
+        if needed to stay within the memory ceiling.
         """
-        # Lazy-load if not preloaded
-        if model_name not in self._models:
-            self._load_model(model_name)
+        self._ensure_model_loaded(model_name)
 
         if self._model_status.get(model_name) != "loaded":
             raise RuntimeError(f"Model '{model_name}' is not available (status: {self._model_status.get(model_name)})")
@@ -375,9 +594,8 @@ class ModelManager:
 
         Returns: { deidentified_text, entities, mapping }
         """
-        # Ensure PII model is loaded
-        if PII_MODEL_NAME not in self._models:
-            self._load_model(PII_MODEL_NAME)
+        # Ensure PII model is loaded (pinned, so this is a fast no-op check)
+        self._ensure_model_loaded(PII_MODEL_NAME)
 
         if self._model_status.get(PII_MODEL_NAME) != "loaded":
             raise RuntimeError(f"PII model not available (status: {self._model_status.get(PII_MODEL_NAME)})")
@@ -468,28 +686,37 @@ class ModelManager:
         }
         return synthetics.get(label.upper(), f"[{label}]")
 
+    # ===========================================
+    # Status & Health
+    # ===========================================
+
     def get_loaded_models(self) -> list[dict]:
-        """Return info about all models and their status."""
+        """Return info about all models and their lifecycle status."""
+        all_models = set(DEFAULT_MODELS.keys()) | set(self._models.keys()) | set(self._model_status.keys())
         return [
             {
                 "name": name,
                 "status": self._model_status.get(name, "unknown"),
                 "load_time_ms": self._model_load_times.get(name),
+                "last_used": self._model_last_used.get(name),
+                "eviction_count": self._eviction_count.get(name, 0),
+                "pinned": name in PINNED_MODELS,
+                "estimated_mb": MODEL_MEMORY_ESTIMATES_MB.get(name),
             }
-            for name in {**DEFAULT_MODELS, **{k: "" for k in self._models}}
+            for name in sorted(all_models)
         ]
 
     def get_available_ner_models(self) -> list[str]:
-        """Return names of loaded NER models (excluding PII and experimental OncologyDetect variants).
+        """Return names of NER models that can be used (loaded, available on disk, or evicted).
         oncology_pubmed IS included (production model in DEFAULT_MODELS).
         oncology_superclinical/oncology_multimed are excluded (on-demand comparison only)."""
         # Experimental models that should NOT run by default
         experimental_oncology = {k for k in ONCOLOGY_MODELS if k != ONCOLOGY_PUBMED_MODEL_NAME}
         return [
-            name for name in self._models
-            if self._model_status.get(name) == "loaded"
-            and name != PII_MODEL_NAME
+            name for name in DEFAULT_MODELS
+            if name != PII_MODEL_NAME
             and name not in experimental_oncology
+            and self._model_status.get(name) in ("loaded", "available", "evicted")
         ]
 
     @property
@@ -503,3 +730,16 @@ class ModelManager:
             return process.memory_info().rss / (1024 * 1024)
         except Exception:
             return 0.0
+
+    @property
+    def memory_stats(self) -> dict:
+        """Memory budget summary for the health endpoint."""
+        rss = self.memory_mb
+        return {
+            "rss_mb": round(rss, 1),
+            "max_mb": self._max_memory_mb,
+            "utilization_pct": round((rss / self._max_memory_mb) * 100, 1) if self._max_memory_mb > 0 else 0,
+            "models_in_ram": sum(1 for s in self._model_status.values() if s == "loaded"),
+            "models_on_disk": sum(1 for s in self._model_status.values() if s in ("available", "evicted")),
+            "total_evictions": sum(self._eviction_count.values()),
+        }

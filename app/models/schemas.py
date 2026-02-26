@@ -133,10 +133,12 @@ class ValidateResponse(BaseModel):
 # ===========================================
 
 class ModelInfo(BaseModel):
-    """Info about a loaded model."""
+    """Info about a model and its lifecycle state."""
     name: str
-    status: str = Field(..., description="loaded | loading | failed")
+    status: str = Field(..., description="loaded | available | loading | evicted | failed")
     load_time_ms: Optional[float] = None
+    pinned: bool = Field(False, description="Whether this model is pinned (never evicted)")
+    eviction_count: int = Field(0, description="Number of times this model was evicted from memory")
 
 
 class HealthResponse(BaseModel):
@@ -144,6 +146,11 @@ class HealthResponse(BaseModel):
     status: str = Field(..., description="ok | degraded | error")
     loaded_models: list[ModelInfo] = Field(default_factory=list)
     models_available: int = 0
-    uptime_seconds: float = 0.0
+    models_loaded: int = Field(0, description="Models currently in RAM")
+    models_on_disk: int = Field(0, description="Models on disk (lazy-loadable)")
     memory_mb: float = 0.0
+    memory_max_mb: float = Field(0.0, description="Configured memory ceiling in MB")
+    memory_utilization_pct: float = Field(0.0, description="Memory utilization percentage")
+    total_evictions: int = Field(0, description="Total model evictions since startup")
+    uptime_seconds: float = 0.0
     version: str = "0.1.0"

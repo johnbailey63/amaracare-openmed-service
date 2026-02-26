@@ -17,7 +17,8 @@ def extract_entities(request: NERRequest) -> NERResponse:
     """
     Run biomedical NER models on clinical text.
 
-    If no models specified, runs all preloaded NER models (disease, pharma, gene, anatomy).
+    If no models specified, runs all available NER models (disease, pharma, gene, anatomy, oncology).
+    Models are lazy-loaded on demand and evicted LRU-style under memory pressure.
     Entities are deduplicated across models — if two models find the same span,
     the higher-confidence result is kept.
     """
@@ -37,6 +38,10 @@ def extract_entities(request: NERRequest) -> NERResponse:
             processing_time_ms=0.0,
             text_length=len(request.text),
         )
+
+    # Pre-load all needed models in parallel (avoids sequential cold-load delays
+    # when multiple models have been evicted from memory)
+    manager.ensure_models_loaded(model_names)
 
     all_entities: list[NEREntity] = []
     models_used: list[str] = []
